@@ -1,0 +1,27 @@
+version: '3'
+
+services:
+#  app:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
+#    ports:
+#      - "8000:8081"
+#    deploy:
+#      restart_policy:
+#        condition: on-failure
+#        delay: 4s
+#        max_attempts: 10
+#    volumes:
+#      - type: bind
+#        source: ./data
+#        target: /root/data
+  test:
+    depends_on: []
+    build:
+      context: .
+      dockerfile: Dockerfile_tests
+  bench:
+    build:
+      context: .
+      dockerfile: Dockerfile_bench
