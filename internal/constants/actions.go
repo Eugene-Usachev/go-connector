@@ -13,6 +13,8 @@ const (
 	Ping   uint8 = 7
 	Get    uint8 = 8
 	Insert uint8 = 9
+	Set    uint8 = 10
+	Delete uint8 = 11
 	// BigAction If the number of action is greater than 255, you need to use big action and add the action number after (like [255u8, 1u8, 254u8])
 	BigAction uint8 = 255
 )

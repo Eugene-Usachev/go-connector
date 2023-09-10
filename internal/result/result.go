@@ -1,6 +1,6 @@
 package result
 
-type Void interface{}
+type Void struct{}
 
 type Result[T any] struct {
 	Value T
