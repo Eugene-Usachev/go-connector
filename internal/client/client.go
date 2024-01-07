@@ -40,11 +40,11 @@
 //	return conn.Ping().Value
 //}
 //
-////// CreateSpace creates a new space in the database. CreateSpace returns the ID of the space.
-////func (c *Client) CreateSpace(engineType constants.SpaceEngineType, name string, size uint32) result.Result[uint16] {
+////// CreateSpaceInMemory creates a new space in the database. CreateSpaceInMemory returns the ID of the space.
+////func (c *Client) CreateSpaceInMemory(engineType constants.SpaceEngineType, name string, size uint32) result.Result[uint16] {
 ////	conn := c.pool.Get().(*conn.Connection)
 ////	defer c.pool.Put(conn)
-////	return conn.CreateSpace(engineType, name, size)
+////	return conn.CreateSpaceInMemory(engineType, name, size)
 ////}
 ////
 ////// GetSpacesNames returns the names of all spaces in the database.
@@ -83,7 +83,8 @@ import (
 )
 
 type Client struct {
-	pool chan *pipe.Pipe
+	writePool chan *pipe.Pipe
+	readPool  chan *pipe.Pipe
 }
 
 type Config struct {
@@ -96,7 +97,8 @@ type Config struct {
 
 func NewClient(cfg *Config) *Client {
 	c := &Client{
-		pool: make(chan *pipe.Pipe, cfg.Par),
+		writePool: make(chan *pipe.Pipe, cfg.Par),
+		readPool:  make(chan *pipe.Pipe, cfg.Par),
 	}
 
 	connPool := &sync.Pool{
@@ -117,21 +119,48 @@ func NewClient(cfg *Config) *Client {
 	}
 
 	for i := 0; i < cfg.Par; i++ {
-		pipeImpl := pipe.NewPipe(pipeCfg)
-		go pipeImpl.Start()
+		pipeImpl1 := pipe.NewPipe(pipeCfg)
+		pipeImpl2 := pipe.NewPipe(pipeCfg)
+		go pipeImpl1.Start()
+		go pipeImpl2.Start()
 		time.Sleep(17 * time.Microsecond)
-		go pipeImpl.StartTimer()
+		go pipeImpl1.StartTimer()
+		go pipeImpl2.StartTimer()
 
-		c.pool <- pipeImpl
+		c.writePool <- pipeImpl1
+		c.readPool <- pipeImpl2
 	}
 
 	return c
 }
 
-func (c *Client) CallFunc(f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
-	conn := <-c.pool
+func (c *Client) CallReadFunc(f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
+	conn := <-c.readPool
 	ch := f(conn)
-	c.pool <- conn
+	c.readPool <- conn
+	var res pipe.Res
+	select {
+	case res = <-ch:
+	case <-time.After(3 * time.Second):
+		return nil, fmt.Errorf("timeout")
+	}
+	if res.Err != nil {
+		return nil, res.Err
+	}
+	if len(res.Slice) < 1 {
+		return nil, fmt.Errorf("empty response")
+	}
+	err := result.DefineError(res.Slice[0])
+	if err != nil {
+		return nil, err
+	}
+	return res.Slice[:], nil
+}
+
+func (c *Client) CallWriteFunc(f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
+	conn := <-c.readPool
+	ch := f(conn)
+	c.readPool <- conn
 	var res pipe.Res
 	select {
 	case res = <-ch:
@@ -153,7 +182,7 @@ func (c *Client) CallFunc(f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error)
 
 // Ping returns true if the connection is alive and false otherwise.
 func (c *Client) Ping() bool {
-	res, err := c.CallFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallReadFunc(func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.Ping()
 	})
 
@@ -170,9 +199,9 @@ func (c *Client) Ping() bool {
 	//return res.Err == nil
 }
 
-func (c *Client) CreateSpace(engineType constants.SpaceEngineType, size uint16, name []byte) result.Result[uint16] {
-	res, err := c.CallFunc(func(conn *pipe.Pipe) chan pipe.Res {
-		return conn.CreateSpace(engineType, size, name)
+func (c *Client) CreateSpaceInMemory(size uint16, name []byte, isItLogging bool) result.Result[uint16] {
+	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
+		return conn.CreateSpaceInMemory(size, name, isItLogging)
 	})
 	if err != nil {
 		return result.Result[uint16]{
@@ -186,35 +215,47 @@ func (c *Client) CreateSpace(engineType constants.SpaceEngineType, size uint16, 
 		Err:   nil,
 		IsOk:  true,
 	}
-	// TODO r
-	//conn := <-c.pool
-	//ch := conn.CreateSpace(engineType, size, name)
-	//c.pool <- conn
-	//res := <-ch
-	//if res.Err != nil {
-	//	return result.Result[uint16]{
-	//		Value: 0,
-	//		Err:   res.Err,
-	//		IsOk:  false,
-	//	}
-	//}
-	//err := result.DefineError(res.Slice[0])
-	//if err != nil {
-	//	return result.Result[uint16]{
-	//		Value: 0,
-	//		Err:   err,
-	//		IsOk:  false,
-	//	}
-	//}
-	//return result.Result[uint16] {
-	//	Value: fastbytes.B2U16(res.Slice[1:3]),
-	//	Err:   nil,
-	//	IsOk:  true,
-	//}
+}
+
+// cacheDuration is a time in seconds.
+func (c *Client) CreateSpaceCache(size uint16, name []byte, isItLogging bool, cacheDuration uint64) result.Result[uint16] {
+	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
+		return conn.CreateSpaceCache(size, name, cacheDuration, isItLogging)
+	})
+	if err != nil {
+		return result.Result[uint16]{
+			Value: 0,
+			Err:   err,
+			IsOk:  false,
+		}
+	}
+	return result.Result[uint16]{
+		Value: fastbytes.B2U16(res[1:3]),
+		Err:   nil,
+		IsOk:  true,
+	}
+}
+
+func (c *Client) CreateSpaceOnDisk(size uint16, name []byte) result.Result[uint16] {
+	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
+		return conn.CreateSpaceOnDisk(size, name)
+	})
+	if err != nil {
+		return result.Result[uint16]{
+			Value: 0,
+			Err:   err,
+			IsOk:  false,
+		}
+	}
+	return result.Result[uint16]{
+		Value: fastbytes.B2U16(res[1:3]),
+		Err:   nil,
+		IsOk:  true,
+	}
 }
 
 func (c *Client) GetSpacesNames() result.Result[[]string] {
-	res, err := c.CallFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallReadFunc(func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.GetSpacesNames()
 	})
 
@@ -246,7 +287,7 @@ func (c *Client) GetSpacesNames() result.Result[[]string] {
 }
 
 func (c *Client) Insert(key []byte, value []byte, spaceId uint16) result.Result[result.Void] {
-	res, err := c.CallFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.Insert(key, value, spaceId)
 	})
 	if err != nil || res[0] != constants.Done {
@@ -265,7 +306,7 @@ func (c *Client) Insert(key []byte, value []byte, spaceId uint16) result.Result[
 }
 
 func (c *Client) Set(key []byte, value []byte, spaceId uint16) result.Result[result.Void] {
-	res, err := c.CallFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.Set(key, value, spaceId)
 	})
 	if err != nil || res[0] != constants.Done {
@@ -284,7 +325,7 @@ func (c *Client) Set(key []byte, value []byte, spaceId uint16) result.Result[res
 }
 
 func (c *Client) Get(key []byte, spaceId uint16) result.Result[[]byte] {
-	res, err := c.CallFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallReadFunc(func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.Get(key, spaceId)
 	})
 	if err != nil || res[0] != constants.Done {
@@ -296,14 +337,33 @@ func (c *Client) Get(key []byte, spaceId uint16) result.Result[[]byte] {
 	}
 
 	return result.Result[[]byte]{
-		Value: res[2:],
+		Value: res[1:],
+		Err:   nil,
+		IsOk:  true,
+	}
+}
+
+func (c *Client) GetAndResetCacheTime(key []byte, spaceId uint16) result.Result[[]byte] {
+	res, err := c.CallReadFunc(func(conn *pipe.Pipe) chan pipe.Res {
+		return conn.GetAndResetCacheTime(key, spaceId)
+	})
+	if err != nil || res[0] != constants.Done {
+		return result.Result[[]byte]{
+			Value: nil,
+			Err:   err,
+			IsOk:  false,
+		}
+	}
+
+	return result.Result[[]byte]{
+		Value: res[1:],
 		Err:   nil,
 		IsOk:  true,
 	}
 }
 
 func (c *Client) Delete(key []byte, spaceId uint16) result.Result[result.Void] {
-	res, err := c.CallFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.Delete(key, spaceId)
 	})
 	if err != nil || res[0] != constants.Done {
@@ -321,11 +381,11 @@ func (c *Client) Delete(key []byte, spaceId uint16) result.Result[result.Void] {
 	}
 }
 
-//// CreateSpace creates a new space in the database. CreateSpace returns the ID of the space.
-//func (c *Client) CreateSpace(engineType constants.SpaceEngineType, name string, size uint32) result.Result[uint16] {
+//// CreateSpaceInMemory creates a new space in the database. CreateSpaceInMemory returns the ID of the space.
+//func (c *Client) CreateSpaceInMemory(engineType constants.SpaceEngineType, name string, size uint32) result.Result[uint16] {
 //	conn := c.pool.Get().(*conn.Connection)
 //	defer c.pool.Put(conn)
-//	return conn.CreateSpace(engineType, name, size)
+//	return conn.CreateSpaceInMemory(engineType, name, size)
 //}
 //
 //// GetSpacesNames returns the names of all spaces in the database.

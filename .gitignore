@@ -17,6 +17,8 @@
 Dockerfile
 /test
 /dev
+/internal/tests
+/internal/constants/test.go
 /.bin
 /fond
 /v2

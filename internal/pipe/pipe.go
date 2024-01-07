@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	bufferSize = 64 * 1024
+	bufferSize = 256 * 1024
 )
 
 type Slice []byte
@@ -28,8 +28,6 @@ type Pipe struct {
 	connPool *sync.Pool
 
 	readBuf []byte
-	// responseBuf is a buffer for storing a big response message.
-	responseBuf []byte
 
 	Result chan Res
 
@@ -53,7 +51,6 @@ func NewPipe(cfg *Config) *Pipe {
 	pipe := &Pipe{
 		writeBuf:            make([]byte, 4, bufferSize),
 		readBuf:             make([]byte, bufferSize),
-		responseBuf:         make([]byte, 0, bufferSize*2),
 		Result:              make(chan Res),
 		queue:               make(chan []byte),
 		maxQueueSize:        cfg.MaxQueueSize,
@@ -73,14 +70,14 @@ func (pipe *Pipe) Start() {
 			pipe.m.Lock()
 			l := len(pipe.writeBuf) + len(data)
 			if l > bufferSize || l > pipe.maxWriteBufferSize {
-				pipe.ExecPipe()
+				pipe.execPipe()
 			}
 
 			pipe.writeBuf = append(pipe.writeBuf, data...)
 
 			pipe.queueSize++
 			if pipe.queueSize == pipe.maxQueueSize {
-				pipe.ExecPipe()
+				pipe.execPipe()
 			}
 
 			pipe.m.Unlock()
@@ -96,14 +93,14 @@ func (pipe *Pipe) StartTimer() {
 			pipe.wasExecutedLastTime = false
 		} else {
 			if pipe.queueSize != 0 {
-				pipe.ExecPipe()
+				pipe.execPipe()
 			}
 		}
 		pipe.m.Unlock()
 	}
 }
 
-func (pipe *Pipe) ExecPipe() {
+func (pipe *Pipe) execPipe() {
 	pipe.wasExecutedLastTime = true
 	writeBufLen := len(pipe.writeBuf)
 	if writeBufLen == 0 {
@@ -124,7 +121,6 @@ func (pipe *Pipe) ExecPipe() {
 		pipe.queueSize = 0
 		return
 	}
-
 	l, err := conn.Read(pipe.readBuf[:])
 	if err != nil {
 		for i := 0; i < pipe.queueSize; i++ {
@@ -136,15 +132,17 @@ func (pipe *Pipe) ExecPipe() {
 		pipe.queueSize = 0
 		return
 	}
-
 	offset := 0
-	for {
-		if pipe.queueSize == 0 {
-			break
-		}
+	size := 0
+	have := 0
 
-		if offset == l {
-			l, err = conn.Read(pipe.readBuf[:])
+	for pipe.queueSize > 0 {
+		have = l - offset
+		if have < 3 {
+			if have != 0 {
+				copy(pipe.readBuf[0:have], pipe.readBuf[offset:offset+have])
+			}
+			l, err = conn.Read(pipe.readBuf[have:])
 			if err != nil {
 				for i := 0; i < pipe.queueSize; i++ {
 					pipe.Result <- Res{
@@ -156,33 +154,39 @@ func (pipe *Pipe) ExecPipe() {
 				return
 			}
 			offset = 0
+			l += have
 		}
 
-		size := int(fastbytes.B2U16(pipe.readBuf[offset : offset+2]))
+		size = int(fastbytes.B2U16(pipe.readBuf[offset : offset+2]))
+		offset += 2
 		if size == 65535 {
 			size = int(fastbytes.B2U32(pipe.readBuf[offset : offset+4]))
 			offset += 4
-		} else {
-			offset += 2
 		}
-		if bufferSize-offset < size {
-			for bufferSize-offset < size {
-				pipe.responseBuf = append(pipe.responseBuf, pipe.readBuf[offset:]...)
-				size -= offset
-				offset, err = conn.Read(pipe.readBuf[offset:])
+
+		for have = l - offset; have < size; have = l - offset {
+			copy(pipe.readBuf[0:have], pipe.readBuf[offset:offset+have])
+			l, err = conn.Read(pipe.readBuf[have:])
+			if err != nil {
+				for i := 0; i < pipe.queueSize; i++ {
+					pipe.Result <- Res{
+						Slice: nil,
+						Err:   err,
+					}
+				}
+				pipe.queueSize = 0
+				return
 			}
-			pipe.Result <- Res{
-				Slice: pipe.responseBuf[:],
-				Err:   nil,
-			}
-			pipe.responseBuf = pipe.responseBuf[:0]
-		} else {
-			pipe.Result <- Res{
-				Slice: pipe.readBuf[offset : offset+size],
-				Err:   nil,
-			}
-			offset += size
+			offset = 0
+			l += have
 		}
+
+		pipe.Result <- Res{
+			Slice: pipe.readBuf[offset : offset+size],
+			Err:   nil,
+		}
+		offset += size
+
 		pipe.queueSize--
 	}
 }
@@ -192,9 +196,29 @@ func (pipe *Pipe) Ping() chan Res {
 	return pipe.Result
 }
 
-func (pipe *Pipe) CreateSpace(engineType constants.SpaceEngineType, size uint16, name []byte) chan Res {
+func boolToByte(b bool) byte {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func (pipe *Pipe) CreateSpaceInMemory(size uint16, name []byte, isItLogging bool) chan Res {
 	length := uint16(len(name)) + 4
-	pipe.queue <- append([]byte{byte(length), byte(length >> 8), constants.CreateSpace, byte(engineType), byte(size), byte(size >> 8)}, name...)
+	pipe.queue <- append([]byte{byte(length), byte(length >> 8), constants.CreateSpaceInMemory, byte(size), byte(size >> 8), boolToByte(isItLogging)}, name...)
+	return pipe.Result
+}
+
+func (pipe *Pipe) CreateSpaceCache(size uint16, name []byte, cacheDuration uint64, isItLogging bool) chan Res {
+	length := uint16(len(name)) + 12
+	pipe.queue <- append([]byte{byte(length), byte(length >> 8), constants.CreateSpaceCache, byte(size), byte(size >> 8), boolToByte(isItLogging),
+		byte(cacheDuration), byte(cacheDuration >> 8), byte(cacheDuration >> 16), byte(cacheDuration >> 24), byte(cacheDuration >> 32), byte(cacheDuration >> 40), byte(cacheDuration >> 48), byte(cacheDuration >> 56)}, name...)
+	return pipe.Result
+}
+
+func (pipe *Pipe) CreateSpaceOnDisk(size uint16, name []byte) chan Res {
+	length := uint16(len(name)) + 3
+	pipe.queue <- append([]byte{byte(length), byte(length >> 8), constants.CreateSpaceOnDisk, byte(size), byte(size >> 8)}, name...)
 	return pipe.Result
 }
 
@@ -233,6 +257,15 @@ func (pipe *Pipe) Get(key []byte, spaceId uint16) chan Res {
 	length := uint16(len(key)) + 3
 	slice := make([]byte, 0, length+2)
 	slice = append(slice, byte(length), byte(length>>8), constants.Get, byte(spaceId), byte(spaceId>>8))
+	slice = append(slice, key...)
+	pipe.queue <- slice
+	return pipe.Result
+}
+
+func (pipe *Pipe) GetAndResetCacheTime(key []byte, spaceId uint16) chan Res {
+	length := uint16(len(key)) + 3
+	slice := make([]byte, 0, length+2)
+	slice = append(slice, byte(length), byte(length>>8), constants.GetAndResetCacheTime, byte(spaceId), byte(spaceId>>8))
 	slice = append(slice, key...)
 	pipe.queue <- slice
 	return pipe.Result

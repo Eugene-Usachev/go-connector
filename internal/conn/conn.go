@@ -66,13 +66,13 @@ package conn
 //	return true
 //}
 //
-////// CreateSpace creates a new space in the database. CreateSpace returns the ID of the space.
-////func (c *Connection) CreateSpace(engineType constants.SpaceEngineType, name string, startSize uint32) result.Result[uint16] {
+////// CreateSpaceInMemory creates a new space in the database. CreateSpaceInMemory returns the ID of the space.
+////func (c *Connection) CreateSpaceInMemory(engineType constants.SpaceEngineType, name string, startSize uint32) result.Result[uint16] {
 ////	buf := make([]byte, 6, 6+len(name))
 ////	defer func() {
 ////		buf = nil
 ////	}()
-////	buf[0] = constants.CreateSpace
+////	buf[0] = constants.CreateSpaceInMemory
 ////	buf[1] = byte(engineType)
 ////	buf[2] = uint8(startSize)
 ////	buf[3] = uint8(startSize >> 8)
