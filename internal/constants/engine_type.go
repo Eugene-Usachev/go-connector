@@ -1,9 +1,9 @@
 package constants
 
-type SpaceEngineType uint8
+type TableEngineType uint8
 
 const (
-	Cache    SpaceEngineType = 0
-	InMemory SpaceEngineType = 1
-	OnDisk   SpaceEngineType = 2
+	Cache    TableEngineType = 0
+	InMemory TableEngineType = 1
+	OnDisk   TableEngineType = 2
 )

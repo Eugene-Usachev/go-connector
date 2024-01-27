@@ -14,9 +14,12 @@
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
+.idea
 Dockerfile
 /test
 /dev
+/internal/tests
+/internal/constants/test.go
 /.bin
 /fond
 /v2
