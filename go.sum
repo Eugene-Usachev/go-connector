@@ -1,4 +1,10 @@
 github.com/Eugene-Usachev/fastbytes v1.2.0 h1:ubLu225ZcxqEx6OJc0McFLOCAmE1j0x9b90wVQ+85XU=
 github.com/Eugene-Usachev/fastbytes v1.2.0/go.mod h1:uebQ2Hy3nWh0TnPLO7qM5pldS6Y+TwGqOuMhCOUtDUc=
+github.com/goccy/go-json v0.10.2 h1:CrxCmQqYDkv1z7lO7Wbh2HN93uovUHgrECaO5ZrCXAU=
+github.com/goccy/go-json v0.10.2/go.mod h1:6MelG93GURQebXPDq3khkgXZkazVtN9CRI+MGFi0w8I=
 github.com/redis/rueidis v1.0.7 h1:1V7BucjgK5oKtJ22VtfqvL5jzJC75RApV0Fb58HXyu4=
 github.com/redis/rueidis v1.0.7/go.mod h1:+1zDH4a8XhwIbCSlIhVGIu6Xib0ZMDoBM0qGhHXc1ew=
+github.com/redis/rueidis v1.0.27 h1:UhTlj+9JBuQe6SHe60YJA+0TonZDi5n/TkJZ7QTyV/s=
+github.com/redis/rueidis v1.0.27/go.mod h1:NT7lPuiVYijdZVsV0V8i9ZUhqe1OMGaq+NiQigNuKlg=
+golang.org/x/sys v0.14.0 h1:Vz7Qs629MkJkGyHxUlRHizWJRG2j8fbQKjELVSNhy7Q=
+golang.org/x/sys v0.14.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=

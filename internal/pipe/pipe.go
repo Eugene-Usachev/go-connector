@@ -3,10 +3,37 @@ package pipe
 import (
 	"github.com/Eugene-Usachev/fastbytes"
 	"github.com/Eugene-Usachev/go-connector/internal/constants"
+	"github.com/Eugene-Usachev/go-connector/internal/scheme"
+	"github.com/goccy/go-json"
+	"log"
 	"net"
 	"sync"
 	"time"
 )
+
+func getSize(len int) int {
+	if len < 65535 {
+		return 2
+	}
+	return 6
+}
+
+func appendSlice(dst []byte, size int, slice []byte) []byte {
+	if size == 2 {
+		dst = append(dst, byte(len(slice)), byte(len(slice)>>8))
+	} else {
+		dst = append(dst, 255, 255, byte(len(slice)), byte(len(slice)>>8), byte(len(slice)>>16), byte(len(slice)>>24))
+	}
+	return append(dst, slice...)
+}
+
+func appendKey(dst []byte, slice []byte) []byte {
+	if len(slice) > 65535 {
+		log.Fatalln("[NimbleDB] Key is too long! Key length must be less than 64 KB!")
+	}
+	dst = append(dst, byte(len(slice)), byte(len(slice)>>8))
+	return append(dst, slice...)
+}
 
 const (
 	bufferSize = 256 * 1024
@@ -48,8 +75,13 @@ type Config struct {
 }
 
 func NewPipe(cfg *Config) *Pipe {
+	if cfg.MaxWriteBufferSize > bufferSize {
+		cfg.MaxWriteBufferSize = bufferSize
+	} else if cfg.MaxWriteBufferSize < 4 {
+		cfg.MaxWriteBufferSize = bufferSize
+	}
 	pipe := &Pipe{
-		writeBuf:            make([]byte, 4, bufferSize),
+		writeBuf:            make([]byte, 4, cfg.MaxWriteBufferSize),
 		readBuf:             make([]byte, bufferSize),
 		Result:              make(chan Res),
 		queue:               make(chan []byte),
@@ -69,8 +101,16 @@ func (pipe *Pipe) Start() {
 		case data := <-pipe.queue:
 			pipe.m.Lock()
 			l := len(pipe.writeBuf) + len(data)
-			if l > bufferSize || l > pipe.maxWriteBufferSize {
-				pipe.execPipe()
+			if l > pipe.maxWriteBufferSize {
+				if len(data) > pipe.maxWriteBufferSize {
+					pipe.writeBuf = append(pipe.writeBuf, data...)
+					pipe.execPipe()
+					pipe.writeBuf = make([]byte, 4, pipe.maxWriteBufferSize)
+					pipe.m.Unlock()
+					continue
+				} else {
+					pipe.execPipe()
+				}
 			}
 
 			pipe.writeBuf = append(pipe.writeBuf, data...)
@@ -203,78 +243,155 @@ func boolToByte(b bool) byte {
 	return 0
 }
 
-func (pipe *Pipe) CreateSpaceInMemory(size uint16, name []byte, isItLogging bool) chan Res {
-	length := uint16(len(name)) + 4
-	pipe.queue <- append([]byte{byte(length), byte(length >> 8), constants.CreateSpaceInMemory, byte(size), byte(size >> 8), boolToByte(isItLogging)}, name...)
+func (pipe *Pipe) CreateTableInMemory(name []byte, scheme *scheme.Scheme, isItLogging bool) chan Res {
+	if len(name) > 65535 {
+		log.Fatalln("[NimbleDB] table name is too long. Name length must be less than 64 KB!")
+	}
+
+	if scheme != nil {
+		schemeJson, err := json.Marshal(scheme)
+		if err != nil {
+			log.Fatalln("[NimbleDB] cannot parse scheme to create table with name", fastbytes.B2S(name), "! Error:", err.Error())
+		}
+		if len(schemeJson) > 65355 {
+			log.Fatalln("[NimbleDB] scheme is too large! Scheme length after marshal must be less than 64KB!")
+		}
+
+		length := len(name) + 4 + len(schemeJson)
+		pipe.queue <- append(
+			append([]byte{byte(length), byte(length >> 8), constants.CreateTableInMemory, boolToByte(isItLogging), byte(len(schemeJson)), byte(len(schemeJson) >> 8)},
+				schemeJson...),
+			name...)
+	} else {
+		length := len(name) + 4
+		pipe.queue <- append(
+			[]byte{byte(length), byte(length >> 8), constants.CreateTableInMemory, boolToByte(isItLogging), 0, 0},
+			name...)
+	}
+	//size := 512
+	//pipe.queue <- append([]byte{byte(length), byte(length >> 8), constants.CreateTableInMemory, byte(size), byte(size >> 8), boolToByte(isItLogging)}, name...)
 	return pipe.Result
 }
 
-func (pipe *Pipe) CreateSpaceCache(size uint16, name []byte, cacheDuration uint64, isItLogging bool) chan Res {
-	length := uint16(len(name)) + 12
-	pipe.queue <- append([]byte{byte(length), byte(length >> 8), constants.CreateSpaceCache, byte(size), byte(size >> 8), boolToByte(isItLogging),
-		byte(cacheDuration), byte(cacheDuration >> 8), byte(cacheDuration >> 16), byte(cacheDuration >> 24), byte(cacheDuration >> 32), byte(cacheDuration >> 40), byte(cacheDuration >> 48), byte(cacheDuration >> 56)}, name...)
+func (pipe *Pipe) CreateTableCache(name []byte, scheme *scheme.Scheme, cacheDuration uint64, isItLogging bool) chan Res {
+	if len(name) > 65535 {
+		log.Fatalln("[NimbleDB] table name is too long. Name length must be less than 64 KB!")
+	}
+	if scheme != nil {
+		schemeJson, err := json.Marshal(scheme)
+		if err != nil {
+			log.Fatalln("[NimbleDB] cannot parse scheme to create table with name", fastbytes.B2S(name), "! Error:", err.Error())
+		}
+		if len(schemeJson) > 65355 {
+			log.Fatalln("[NimbleDB] scheme is too large! Scheme length after marshal must be less than 64KB!")
+		}
+
+		length := len(name) + 12 + len(schemeJson)
+		pipe.queue <- append(append([]byte{byte(length), byte(length >> 8), constants.CreateTableCache, boolToByte(isItLogging),
+			byte(cacheDuration), byte(cacheDuration >> 8), byte(cacheDuration >> 16), byte(cacheDuration >> 24), byte(cacheDuration >> 32),
+			byte(cacheDuration >> 40), byte(cacheDuration >> 48), byte(cacheDuration >> 56),
+			byte(len(schemeJson)), byte(len(schemeJson) >> 8)}, schemeJson...), name...)
+	} else {
+		length := uint16(len(name)) + 12
+		pipe.queue <- append([]byte{byte(length), byte(length >> 8), constants.CreateTableCache, boolToByte(isItLogging),
+			byte(cacheDuration), byte(cacheDuration >> 8), byte(cacheDuration >> 16), byte(cacheDuration >> 24), byte(cacheDuration >> 32),
+			byte(cacheDuration >> 40), byte(cacheDuration >> 48), byte(cacheDuration >> 56), 0, 0}, name...)
+	}
 	return pipe.Result
 }
 
-func (pipe *Pipe) CreateSpaceOnDisk(size uint16, name []byte) chan Res {
-	length := uint16(len(name)) + 3
-	pipe.queue <- append([]byte{byte(length), byte(length >> 8), constants.CreateSpaceOnDisk, byte(size), byte(size >> 8)}, name...)
+func (pipe *Pipe) CreateTableOnDisk(name []byte, scheme *scheme.Scheme) chan Res {
+	if len(name) > 65535 {
+		log.Fatalln("[NimbleDB] table name is too long. Name length must be less than 64 KB!")
+	}
+	if scheme != nil {
+		schemeJson, err := json.Marshal(scheme)
+		if err != nil {
+			log.Fatalln("[NimbleDB] cannot parse scheme to create table with name", fastbytes.B2S(name), "! Error:", err.Error())
+		}
+		if len(schemeJson) > 65355 {
+			log.Fatalln("[NimbleDB] scheme is too large! Scheme length after marshal must be less than 64KB!")
+		}
+
+		length := len(name) + 3 + len(schemeJson)
+		pipe.queue <- append(append([]byte{byte(length), byte(length >> 8), constants.CreateTableOnDisk,
+			byte(len(schemeJson)), byte(len(schemeJson) >> 8)}, schemeJson...), name...)
+
+	} else {
+		length := uint16(len(name)) + 3
+		pipe.queue <- append([]byte{byte(length), byte(length >> 8), constants.CreateTableOnDisk, 0, 0}, name...)
+	}
 	return pipe.Result
 }
 
-func (pipe *Pipe) GetSpacesNames() chan Res {
-	pipe.queue <- []byte{1, 0, constants.GetSpacesNames}
+func (pipe *Pipe) GetTablesNames() chan Res {
+	pipe.queue <- []byte{1, 0, constants.GetTablesNames}
 	return pipe.Result
 }
 
-func (pipe *Pipe) Insert(key []byte, value []byte, spaceId uint16) chan Res {
-	keyLength := uint16(len(key))
-	valueLength := uint16(len(value))
-	// spaceId (2) + key length (2)  + msg type(1) = 7
+func (pipe *Pipe) Insert(key []byte, value []byte, tableId uint16) chan Res {
+	keyLength := len(key)
+	valueLength := len(value)
 	length := 5 + keyLength + valueLength
-	slice := make([]byte, 0, length+2)
-	slice = append(slice, byte(length), byte(length>>8), constants.Insert, byte(spaceId), byte(spaceId>>8), byte(keyLength), byte(keyLength>>8))
-	slice = append(slice, key...)
+	lengthSize := getSize(length)
+
+	slice := make([]byte, 0, length+lengthSize)
+	if length < 65535 {
+		slice = append(slice, byte(length), byte(length>>8), constants.Insert, byte(tableId), byte(tableId>>8))
+	} else {
+		slice = append(slice, 255, 255, byte(length), byte(length>>8), byte(length>>16), byte(length>>24), constants.Insert, byte(tableId), byte(tableId>>8))
+	}
+
+	slice = appendKey(slice, key)
 	slice = append(slice, value...)
+
 	pipe.queue <- slice
 	return pipe.Result
 }
 
-func (pipe *Pipe) Set(key []byte, value []byte, spaceId uint16) chan Res {
-	keyLength := uint16(len(key))
-	valueLength := uint16(len(value))
-	// spaceId (2) + key length (2)  + msg type(1) = 7
+func (pipe *Pipe) Set(key []byte, value []byte, tableId uint16) chan Res {
+	keyLength := len(key)
+	valueLength := len(value)
 	length := 5 + keyLength + valueLength
-	slice := make([]byte, 0, length+2)
-	slice = append(slice, byte(length), byte(length>>8), constants.Set, byte(spaceId), byte(spaceId>>8), byte(keyLength), byte(keyLength>>8))
-	slice = append(slice, key...)
+	lengthSize := getSize(length)
+
+	slice := make([]byte, 0, length+lengthSize)
+	if length < 65535 {
+		slice = append(slice, byte(length), byte(length>>8), constants.Set, byte(tableId), byte(tableId>>8))
+	} else {
+		slice = append(slice, 255, 255, byte(length), byte(length>>8), byte(length>>16), byte(length>>24), constants.Set, byte(tableId), byte(tableId>>8))
+	}
+
+	slice = appendKey(slice, key)
 	slice = append(slice, value...)
+
 	pipe.queue <- slice
 	return pipe.Result
 }
 
-func (pipe *Pipe) Get(key []byte, spaceId uint16) chan Res {
+func (pipe *Pipe) Get(key []byte, tableId uint16) chan Res {
 	length := uint16(len(key)) + 3
 	slice := make([]byte, 0, length+2)
-	slice = append(slice, byte(length), byte(length>>8), constants.Get, byte(spaceId), byte(spaceId>>8))
+	slice = append(slice, byte(length), byte(length>>8), constants.Get, byte(tableId), byte(tableId>>8))
 	slice = append(slice, key...)
 	pipe.queue <- slice
 	return pipe.Result
 }
 
-func (pipe *Pipe) GetAndResetCacheTime(key []byte, spaceId uint16) chan Res {
+// TODO r
+func (pipe *Pipe) GetAndResetCacheTime(key []byte, tableId uint16) chan Res {
 	length := uint16(len(key)) + 3
 	slice := make([]byte, 0, length+2)
-	slice = append(slice, byte(length), byte(length>>8), constants.GetAndResetCacheTime, byte(spaceId), byte(spaceId>>8))
+	slice = append(slice, byte(length), byte(length>>8), constants.GetAndResetCacheTime, byte(tableId), byte(tableId>>8))
 	slice = append(slice, key...)
 	pipe.queue <- slice
 	return pipe.Result
 }
 
-func (pipe *Pipe) Delete(key []byte, spaceId uint16) chan Res {
+func (pipe *Pipe) Delete(key []byte, tableId uint16) chan Res {
 	length := uint16(len(key)) + 3
 	slice := make([]byte, 0, length+2)
-	slice = append(slice, byte(length), byte(length>>8), constants.Delete, byte(spaceId), byte(spaceId>>8))
+	slice = append(slice, byte(length), byte(length>>8), constants.Delete, byte(tableId), byte(tableId>>8))
 	slice = append(slice, key...)
 	pipe.queue <- slice
 	return pipe.Result

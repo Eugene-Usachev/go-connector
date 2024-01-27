@@ -8,7 +8,7 @@ import (
 var (
 	BadRequest    = errors.New("bad request")
 	InternalError = errors.New("internal error")
-	SpaceNotFound = errors.New("space not found")
+	TableNotFound = errors.New("table not found")
 	NotFound      = errors.New("not found")
 )
 
@@ -20,8 +20,8 @@ func DefineError(code uint8) error {
 		return BadRequest
 	case constants.InternalError:
 		return InternalError
-	case constants.SpaceNotFound:
-		return SpaceNotFound
+	case constants.TableNotFound:
+		return TableNotFound
 	case constants.NotFound:
 		return NotFound
 	}
