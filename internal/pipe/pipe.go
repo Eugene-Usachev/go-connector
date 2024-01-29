@@ -1,8 +1,10 @@
 package pipe
 
 import (
+	"errors"
 	"github.com/Eugene-Usachev/fastbytes"
 	"github.com/Eugene-Usachev/go-connector/internal/constants"
+	"github.com/Eugene-Usachev/go-connector/internal/reader"
 	"github.com/Eugene-Usachev/go-connector/internal/scheme"
 	"github.com/goccy/go-json"
 	"log"
@@ -40,6 +42,7 @@ const (
 )
 
 type Slice []byte
+
 type Msg struct {
 	data []byte
 	ch   chan Res
@@ -54,18 +57,18 @@ type Pipe struct {
 	writeBuf []byte
 	connPool *sync.Pool
 
-	readBuf []byte
+	reader *reader.BufReader
 
 	Result chan Res
 
 	queue              chan []byte
-	queueSize          int
+	QueueSize          int
 	maxQueueSize       int
 	maxWriteBufferSize int
 
-	m *sync.Mutex
+	Mu *sync.Mutex
 
-	wasExecutedLastTime bool
+	WasExecutedLastTime bool
 }
 
 type Config struct {
@@ -82,15 +85,15 @@ func NewPipe(cfg *Config) *Pipe {
 	}
 	pipe := &Pipe{
 		writeBuf:            make([]byte, 4, cfg.MaxWriteBufferSize),
-		readBuf:             make([]byte, bufferSize),
+		reader:              reader.NewBufReader(),
 		Result:              make(chan Res),
 		queue:               make(chan []byte),
 		maxQueueSize:        cfg.MaxQueueSize,
 		connPool:            cfg.ConnPool,
 		maxWriteBufferSize:  cfg.MaxWriteBufferSize,
-		m:                   &sync.Mutex{},
-		queueSize:           0,
-		wasExecutedLastTime: false,
+		Mu:                  &sync.Mutex{},
+		QueueSize:           0,
+		WasExecutedLastTime: false,
 	}
 	return pipe
 }
@@ -99,28 +102,28 @@ func (pipe *Pipe) Start() {
 	for {
 		select {
 		case data := <-pipe.queue:
-			pipe.m.Lock()
+			pipe.Mu.Lock()
 			l := len(pipe.writeBuf) + len(data)
 			if l > pipe.maxWriteBufferSize {
 				if len(data) > pipe.maxWriteBufferSize {
 					pipe.writeBuf = append(pipe.writeBuf, data...)
-					pipe.execPipe()
+					pipe.ExecPipe()
 					pipe.writeBuf = make([]byte, 4, pipe.maxWriteBufferSize)
-					pipe.m.Unlock()
+					pipe.Mu.Unlock()
 					continue
 				} else {
-					pipe.execPipe()
+					pipe.ExecPipe()
 				}
 			}
 
 			pipe.writeBuf = append(pipe.writeBuf, data...)
 
-			pipe.queueSize++
-			if pipe.queueSize == pipe.maxQueueSize {
-				pipe.execPipe()
+			pipe.QueueSize++
+			if pipe.QueueSize == pipe.maxQueueSize {
+				pipe.ExecPipe()
 			}
 
-			pipe.m.Unlock()
+			pipe.Mu.Unlock()
 		}
 	}
 }
@@ -128,111 +131,116 @@ func (pipe *Pipe) Start() {
 func (pipe *Pipe) StartTimer() {
 	for {
 		time.Sleep(100 * time.Microsecond)
-		pipe.m.Lock()
-		if pipe.wasExecutedLastTime {
-			pipe.wasExecutedLastTime = false
+		pipe.Mu.Lock()
+		if pipe.WasExecutedLastTime {
+			pipe.WasExecutedLastTime = false
 		} else {
-			if pipe.queueSize != 0 {
-				pipe.execPipe()
+			if pipe.QueueSize != 0 {
+				pipe.ExecPipe()
 			}
 		}
-		pipe.m.Unlock()
+		pipe.Mu.Unlock()
 	}
 }
 
-func (pipe *Pipe) execPipe() {
-	pipe.wasExecutedLastTime = true
+func (pipe *Pipe) ExecPipe() {
+	pipe.WasExecutedLastTime = true
 	writeBufLen := len(pipe.writeBuf)
 	if writeBufLen == 0 {
 		return
 	}
 	conn := pipe.connPool.Get().(net.Conn)
+	err := conn.SetWriteDeadline(time.Now().Add(time.Second * 3))
+	if err != nil {
+		for i := 0; i < pipe.QueueSize; i++ {
+			pipe.Result <- Res{
+				Slice: nil,
+				Err:   err,
+			}
+		}
+		pipe.QueueSize = 0
+		return
+	}
 	defer pipe.connPool.Put(conn)
 	pipe.writeBuf[0], pipe.writeBuf[1], pipe.writeBuf[2], pipe.writeBuf[3] = byte(writeBufLen), byte(writeBufLen>>8), byte(writeBufLen>>16), byte(writeBufLen>>24)
-	_, err := conn.Write(pipe.writeBuf[:writeBufLen])
+	_, err = conn.Write(pipe.writeBuf[:writeBufLen])
 	pipe.writeBuf = pipe.writeBuf[:4]
 	if err != nil {
-		for i := 0; i < pipe.queueSize; i++ {
+		for i := 0; i < pipe.QueueSize; i++ {
 			pipe.Result <- Res{
 				Slice: nil,
 				Err:   err,
 			}
 		}
-		pipe.queueSize = 0
+		pipe.QueueSize = 0
 		return
 	}
-	l, err := conn.Read(pipe.readBuf[:])
+
+	err = conn.SetReadDeadline(time.Now().Add(time.Second * 3))
 	if err != nil {
-		for i := 0; i < pipe.queueSize; i++ {
+		for i := 0; i < pipe.QueueSize; i++ {
 			pipe.Result <- Res{
 				Slice: nil,
 				Err:   err,
 			}
 		}
-		pipe.queueSize = 0
+		pipe.QueueSize = 0
 		return
 	}
-	offset := 0
-	size := 0
-	have := 0
+	pipe.reader.SetReader(conn)
+	var (
+		res    []byte
+		status reader.Status
+	)
 
-	for pipe.queueSize > 0 {
-		have = l - offset
-		if have < 3 {
-			if have != 0 {
-				copy(pipe.readBuf[0:have], pipe.readBuf[offset:offset+have])
+	for pipe.QueueSize > 0 {
+		res, status = pipe.reader.ReadMessageWithoutRequest()
+		if status == reader.Ok {
+			pipe.Result <- Res{
+				Slice: res,
+				Err:   nil,
 			}
-			l, err = conn.Read(pipe.readBuf[have:])
-			if err != nil {
-				for i := 0; i < pipe.queueSize; i++ {
+		} else {
+			switch status {
+			case reader.Closed:
+				for i := 0; i < pipe.QueueSize; i++ {
 					pipe.Result <- Res{
 						Slice: nil,
-						Err:   err,
+						Err:   errors.New("connection closed"),
 					}
 				}
-				pipe.queueSize = 0
+				pipe.QueueSize = 0
 				return
-			}
-			offset = 0
-			l += have
-		}
-
-		size = int(fastbytes.B2U16(pipe.readBuf[offset : offset+2]))
-		offset += 2
-		if size == 65535 {
-			size = int(fastbytes.B2U32(pipe.readBuf[offset : offset+4]))
-			offset += 4
-		}
-
-		for have = l - offset; have < size; have = l - offset {
-			copy(pipe.readBuf[0:have], pipe.readBuf[offset:offset+have])
-			l, err = conn.Read(pipe.readBuf[have:])
-			if err != nil {
-				for i := 0; i < pipe.queueSize; i++ {
+			case reader.Error:
+				for i := 0; i < pipe.QueueSize; i++ {
 					pipe.Result <- Res{
 						Slice: nil,
-						Err:   err,
+						Err:   errors.New("connection error"),
 					}
 				}
-				pipe.queueSize = 0
+				pipe.QueueSize = 0
 				return
+			default:
+				panic("unhandled default case")
 			}
-			offset = 0
-			l += have
 		}
-
-		pipe.Result <- Res{
-			Slice: pipe.readBuf[offset : offset+size],
-			Err:   nil,
-		}
-		offset += size
-
-		pipe.queueSize--
+		pipe.QueueSize -= 1
 	}
+	pipe.reader.Reset()
 }
 
 func (pipe *Pipe) Ping() chan Res {
 	pipe.queue <- []byte{1, 0, constants.Ping}
+	return pipe.Result
+}
+
+func (pipe *Pipe) GetShardMetadata() chan Res {
+	pipe.queue <- []byte{1, 0, constants.GetShardMetadata}
+	return pipe.Result
+}
+
+func (pipe *Pipe) GetHierarchy() chan Res {
+	pipe.queue <- []byte{1, 0, constants.GetHierarchy}
 	return pipe.Result
 }
 
