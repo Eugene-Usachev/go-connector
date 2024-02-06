@@ -15,12 +15,21 @@ import (
 	"time"
 )
 
+func getHash(key []byte) uint64 {
+	var hash uint64 = 0
+	for _, b := range key {
+		hash = (hash << 5) - hash + uint64(b)
+	}
+	return hash
+}
+
 type Client struct {
 	hierarchy     [][]string
 	shardMetadata []atomic.Uint32
 
-	writePool chan *pipe.Pipe
-	readPool  chan *pipe.Pipe
+	serverConn *pipe.Pipe
+	writePool  []*pipe.Pipe
+	readPool   []*pipe.Pipe
 }
 
 type Config struct {
@@ -36,66 +45,106 @@ type Config struct {
 func NewClient(cfg *Config) (*Client, error) {
 	connPool := &sync.Pool{
 		New: func() interface{} {
-			conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", cfg.Host, cfg.Port))
-			if err != nil {
-				log.Println("[NimbleDB] Error connecting to the database: ", err)
-				return nil
-			}
-			if len(cfg.Password) > 0 {
-				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				_, err = conn.Write(fastbytes.S2B(cfg.Password))
+			retries := 0
+			retry:
+				conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", cfg.Host, cfg.Port))
 				if err != nil {
 					log.Println("[NimbleDB] Error connecting to the database: ", err)
 					return nil
 				}
+				if len(cfg.Password) > 0 {
+					err := conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
+					if err != nil {
+						if retries > 10 {
+							return nil
+						}
+						retries++
+						goto retry
+					}
+					_, err = conn.Write(fastbytes.S2B(cfg.Password))
+					if err != nil {
+						if retries > 10 {
+							log.Println("[NimbleDB] Error connecting to the database: ", err)
+							return nil
+						}
+						retries++
+						goto retry
+					}
 
-				status := make([]byte, 1)
-				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-				_, err = conn.Read(status[:])
-				if err != nil {
-					log.Println("[NimbleDB] Error connecting to the database: ", err)
-					return nil
-				}
-				if status[0] != constants.Done {
-					log.Println("[NimbleDB] Error connecting to the database. Status: ", string(status))
-					return nil
-				}
+					status := make([]byte, 1)
+					err = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+					if err != nil {
+						if retries > 10 {
+							return nil
+						}
+						retries++
+						goto retry
+					}
+					_, err = conn.Read(status[:])
+					if err != nil {
+						if retries > 10 {
+							log.Println("[NimbleDB] Error connecting to the database: ", err)
+							return nil
+						}
+						retries++
+						goto retry
+					}
+					if status[0] != constants.Done {
+						if retries > 10 {
+							log.Println("[NimbleDB] Error connecting to the database. Status: ", string(status))
+							return nil
+						}
+						retries++
+						goto retry
+					}
 			}
 
 			return conn
 		},
 	}
 
-	pipeCfg := &pipe.Config{
-		ConnPool:           connPool,
-		MaxQueueSize:       cfg.MaxQueueSize,
-		MaxWriteBufferSize: cfg.MaxWriteBufferSize,
-	}
+	// TODO not 6
+	writePipes := make([]*pipe.Pipe, 0, 6)
+	readPipes := make([]*pipe.Pipe, 0, 6)
 
 	c := &Client{
 		hierarchy:     nil,
 		shardMetadata: nil,
 
-		writePool: make(chan *pipe.Pipe, cfg.Par),
-		readPool:  make(chan *pipe.Pipe, cfg.Par),
+		serverConn: pipe.NewPipe(&pipe.Config{
+			ConnPool:           connPool,
+			ShardNumber:        ^uint32(0),
+			MaxQueueSize:       cfg.MaxQueueSize,
+			MaxWriteBufferSize: cfg.MaxWriteBufferSize,
+		}),
+		writePool: writePipes,
+		readPool:  readPipes,
 	}
-
+	go c.serverConn.Start()
+	go c.serverConn.StartTimer()
 	for i := 0; i < cfg.Par; i++ {
-		pipeImpl1 := pipe.NewPipe(pipeCfg)
-		pipeImpl2 := pipe.NewPipe(pipeCfg)
+		pipeCfgForShard := &pipe.Config{
+			ConnPool: connPool,
+			// TODO not 6
+			ShardNumber:        uint32(i % 6),
+			MaxQueueSize:       cfg.MaxQueueSize,
+			MaxWriteBufferSize: cfg.MaxWriteBufferSize,
+		}
+		pipeImpl1 := pipe.NewPipe(pipeCfgForShard)
+		pipeImpl2 := pipe.NewPipe(pipeCfgForShard)
 		go pipeImpl1.Start()
 		go pipeImpl2.Start()
 		time.Sleep(17 * time.Microsecond)
 		go pipeImpl1.StartTimer()
 		go pipeImpl2.StartTimer()
 
-		c.writePool <- pipeImpl1
-		c.readPool <- pipeImpl2
+		c.writePool = append(c.writePool, pipeImpl1)
+		c.readPool = append(c.readPool, pipeImpl2)
 	}
 
 	tries := 0
 	{
-		conn := <-c.readPool
+		conn := c.serverConn
 	connect:
 		pingRes := conn.Ping()
 		shardMetadataRes := conn.GetShardMetadata()
@@ -106,7 +155,6 @@ func NewClient(cfg *Config) (*Client, error) {
 			time.Sleep(time.Millisecond * 200)
 			tries++
 			if tries == 50 {
-				c.readPool <- conn
 				return nil, errors.New("can't connect to the server")
 			}
 			<-shardMetadataRes
@@ -119,7 +167,6 @@ func NewClient(cfg *Config) (*Client, error) {
 			time.Sleep(time.Millisecond * 200)
 			tries++
 			if tries == 50 {
-				c.readPool <- conn
 				return nil, errors.New("can't get shard metadata")
 			}
 			<-hierarchyRes
@@ -136,7 +183,6 @@ func NewClient(cfg *Config) (*Client, error) {
 			time.Sleep(time.Millisecond * 200)
 			tries++
 			if tries == 50 {
-				c.readPool <- conn
 				return nil, errors.New("can't get hierarchy")
 			}
 			goto connect
@@ -169,19 +215,37 @@ func NewClient(cfg *Config) (*Client, error) {
 		hierarchy = append(hierarchy, node)
 		c.hierarchy = make([][]string, len(hierarchy))
 		copy(c.hierarchy, hierarchy[:])
-		c.readPool <- conn
 	}
 
 	return c, nil
 }
 
-func (c *Client) CallReadFunc(f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
+func (c *Client) CallServerFunc(f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
+	conn := c.serverConn
+	ch := f(conn)
+	var res pipe.Res
+	// TODO: now unsafe!
+	res = <-ch
+	if res.Err != nil {
+		return nil, res.Err
+	}
+	if len(res.Slice) < 1 {
+		return nil, fmt.Errorf("empty response")
+	}
+	err := result.DefineError(res.Slice[0])
+	if err != nil {
+		return nil, err
+	}
+	return res.Slice[:], nil
+}
+
+func (c *Client) CallReadFunc(hash uint64, f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
 	retryCount := 0
 retry:
-	conn := <-c.readPool
+	conn := c.readPool[hash%6]
 	ch := f(conn)
-	c.readPool <- conn
 	var res pipe.Res
+	// TODO: now unsafe!
 	res = <-ch
 	if res.Err != nil {
 		retryCount++
@@ -200,11 +264,11 @@ retry:
 	return res.Slice[:], nil
 }
 
-func (c *Client) CallWriteFunc(f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
-	conn := <-c.writePool
+func (c *Client) CallWriteFunc(hash uint64, f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
+	conn := c.writePool[hash%6]
 	ch := f(conn)
-	c.writePool <- conn
 	var res pipe.Res
+	// TODO: now unsafe!
 	res = <-ch
 	if res.Err != nil {
 		return nil, res.Err
@@ -221,7 +285,7 @@ func (c *Client) CallWriteFunc(f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, e
 
 // Ping returns true if the connection is alive and false otherwise.
 func (c *Client) Ping() bool {
-	res, err := c.CallReadFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallServerFunc(func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.Ping()
 	})
 
@@ -242,7 +306,7 @@ func (c *Client) Ping() bool {
 }
 
 func (c *Client) CreateTableInMemory(name []byte, scheme *scheme.Scheme, isItLogging bool) result.Result[uint16] {
-	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallServerFunc(func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.CreateTableInMemory(name, scheme, isItLogging)
 	})
 	if err != nil {
@@ -261,7 +325,7 @@ func (c *Client) CreateTableInMemory(name []byte, scheme *scheme.Scheme, isItLog
 
 // cacheDuration is a time in minutes.
 func (c *Client) CreateTableCache(name []byte, scheme *scheme.Scheme, isItLogging bool, cacheDuration uint64) result.Result[uint16] {
-	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallServerFunc(func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.CreateTableCache(name, scheme, cacheDuration, isItLogging)
 	})
 	if err != nil {
@@ -279,7 +343,7 @@ func (c *Client) CreateTableCache(name []byte, scheme *scheme.Scheme, isItLoggin
 }
 
 func (c *Client) CreateTableOnDisk(name []byte, scheme *scheme.Scheme) result.Result[uint16] {
-	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallServerFunc(func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.CreateTableOnDisk(name, scheme)
 	})
 	if err != nil {
@@ -297,7 +361,7 @@ func (c *Client) CreateTableOnDisk(name []byte, scheme *scheme.Scheme) result.Re
 }
 
 func (c *Client) GetTablesNames() result.Result[[]string] {
-	res, err := c.CallReadFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallServerFunc(func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.GetTablesNames()
 	})
 
@@ -329,7 +393,7 @@ func (c *Client) GetTablesNames() result.Result[[]string] {
 }
 
 func (c *Client) Insert(key []byte, value []byte, tableId uint16) result.Result[result.Void] {
-	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallWriteFunc(getHash(key), func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.Insert(key, value, tableId)
 	})
 	if err != nil || res[0] != constants.Done {
@@ -348,7 +412,7 @@ func (c *Client) Insert(key []byte, value []byte, tableId uint16) result.Result[
 }
 
 func (c *Client) Set(key []byte, value []byte, tableId uint16) result.Result[result.Void] {
-	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallWriteFunc(getHash(key), func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.Set(key, value, tableId)
 	})
 	if err != nil || res[0] != constants.Done {
@@ -367,7 +431,7 @@ func (c *Client) Set(key []byte, value []byte, tableId uint16) result.Result[res
 }
 
 func (c *Client) Get(key []byte, tableId uint16) result.Result[[]byte] {
-	res, err := c.CallReadFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallReadFunc(getHash(key), func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.Get(key, tableId)
 	})
 	if err != nil || res[0] != constants.Done {
@@ -386,7 +450,7 @@ func (c *Client) Get(key []byte, tableId uint16) result.Result[[]byte] {
 }
 
 func (c *Client) GetAndResetCacheTime(key []byte, tableId uint16) result.Result[[]byte] {
-	res, err := c.CallReadFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallReadFunc(getHash(key), func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.GetAndResetCacheTime(key, tableId)
 	})
 	if err != nil || res[0] != constants.Done {
@@ -405,7 +469,7 @@ func (c *Client) GetAndResetCacheTime(key []byte, tableId uint16) result.Result[
 }
 
 func (c *Client) Delete(key []byte, tableId uint16) result.Result[result.Void] {
-	res, err := c.CallWriteFunc(func(conn *pipe.Pipe) chan pipe.Res {
+	res, err := c.CallWriteFunc(getHash(key), func(conn *pipe.Pipe) chan pipe.Res {
 		return conn.Delete(key, tableId)
 	})
 	if err != nil || res[0] != constants.Done {

@@ -73,6 +73,7 @@ type Pipe struct {
 
 type Config struct {
 	ConnPool           *sync.Pool
+	ShardNumber        uint32
 	MaxQueueSize       int
 	MaxWriteBufferSize int
 }
@@ -80,11 +81,11 @@ type Config struct {
 func NewPipe(cfg *Config) *Pipe {
 	if cfg.MaxWriteBufferSize > bufferSize {
 		cfg.MaxWriteBufferSize = bufferSize
-	} else if cfg.MaxWriteBufferSize < 4 {
+	} else if cfg.MaxWriteBufferSize < 8 {
 		cfg.MaxWriteBufferSize = bufferSize
 	}
 	pipe := &Pipe{
-		writeBuf:            make([]byte, 4, cfg.MaxWriteBufferSize),
+		writeBuf:            make([]byte, 8, cfg.MaxWriteBufferSize),
 		reader:              reader.NewBufReader(),
 		Result:              make(chan Res),
 		queue:               make(chan []byte),
@@ -95,6 +96,7 @@ func NewPipe(cfg *Config) *Pipe {
 		QueueSize:           0,
 		WasExecutedLastTime: false,
 	}
+	pipe.writeBuf[0], pipe.writeBuf[1], pipe.writeBuf[2], pipe.writeBuf[3] = byte(cfg.ShardNumber), byte(cfg.ShardNumber>>8), byte(cfg.ShardNumber>>16), byte(cfg.ShardNumber>>24)
 	return pipe
 }
 
@@ -108,7 +110,7 @@ func (pipe *Pipe) Start() {
 				if len(data) > pipe.maxWriteBufferSize {
 					pipe.writeBuf = append(pipe.writeBuf, data...)
 					pipe.ExecPipe()
-					pipe.writeBuf = make([]byte, 4, pipe.maxWriteBufferSize)
+					pipe.writeBuf = make([]byte, 8, pipe.maxWriteBufferSize)
 					pipe.Mu.Unlock()
 					continue
 				} else {
@@ -150,7 +152,7 @@ func (pipe *Pipe) ExecPipe() {
 		return
 	}
 	conn := pipe.connPool.Get().(net.Conn)
-	err := conn.SetWriteDeadline(time.Now().Add(time.Second * 3))
+	err := conn.SetWriteDeadline(time.Now().Add(time.Second * 15))
 	if err != nil {
 		for i := 0; i < pipe.QueueSize; i++ {
 			pipe.Result <- Res{
@@ -162,9 +164,9 @@ func (pipe *Pipe) ExecPipe() {
 		return
 	}
 	defer pipe.connPool.Put(conn)
-	pipe.writeBuf[0], pipe.writeBuf[1], pipe.writeBuf[2], pipe.writeBuf[3] = byte(writeBufLen), byte(writeBufLen>>8), byte(writeBufLen>>16), byte(writeBufLen>>24)
+	pipe.writeBuf[4], pipe.writeBuf[5], pipe.writeBuf[6], pipe.writeBuf[7] = byte(writeBufLen), byte(writeBufLen>>8), byte(writeBufLen>>16), byte(writeBufLen>>24)
 	_, err = conn.Write(pipe.writeBuf[:writeBufLen])
-	pipe.writeBuf = pipe.writeBuf[:4]
+	pipe.writeBuf = pipe.writeBuf[:8]
 	if err != nil {
 		for i := 0; i < pipe.QueueSize; i++ {
 			pipe.Result <- Res{
@@ -176,7 +178,7 @@ func (pipe *Pipe) ExecPipe() {
 		return
 	}
 
-	err = conn.SetReadDeadline(time.Now().Add(time.Second * 3))
+	err = conn.SetReadDeadline(time.Now().Add(time.Second * 15))
 	if err != nil {
 		for i := 0; i < pipe.QueueSize; i++ {
 			pipe.Result <- Res{
