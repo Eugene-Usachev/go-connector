@@ -107,12 +107,12 @@ func (pipe *Pipe) Start() {
 			if l > pipe.maxWriteBufferSize {
 				if len(data) > pipe.maxWriteBufferSize {
 					pipe.writeBuf = append(pipe.writeBuf, data...)
-					pipe.ExecPipe()
+					pipe.execPipe()
 					pipe.writeBuf = make([]byte, 4, pipe.maxWriteBufferSize)
 					pipe.Mu.Unlock()
 					continue
 				} else {
-					pipe.ExecPipe()
+					pipe.execPipe()
 				}
 			}
 
@@ -120,7 +120,7 @@ func (pipe *Pipe) Start() {
 
 			pipe.QueueSize++
 			if pipe.QueueSize == pipe.maxQueueSize {
-				pipe.ExecPipe()
+				pipe.execPipe()
 			}
 
 			pipe.Mu.Unlock()
@@ -128,22 +128,34 @@ func (pipe *Pipe) Start() {
 	}
 }
 
-func (pipe *Pipe) StartTimer() {
-	for {
-		time.Sleep(100 * time.Microsecond)
-		pipe.Mu.Lock()
-		if pipe.WasExecutedLastTime {
-			pipe.WasExecutedLastTime = false
-		} else {
-			if pipe.QueueSize != 0 {
-				pipe.ExecPipe()
-			}
-		}
-		pipe.Mu.Unlock()
-	}
-}
+//func (pipe *Pipe) StartTimer() {
+//	for {
+//		time.Sleep(100 * time.Microsecond)
+//		pipe.Mu.Lock()
+//		if pipe.WasExecutedLastTime {
+//			pipe.WasExecutedLastTime = false
+//		} else {
+//			if pipe.QueueSize != 0 {
+//				pipe.execPipe()
+//			}
+//		}
+//		pipe.Mu.Unlock()
+//	}
+//}
 
 func (pipe *Pipe) ExecPipe() {
+	pipe.Mu.Lock()
+	if pipe.WasExecutedLastTime {
+		pipe.WasExecutedLastTime = false
+	} else {
+		if pipe.QueueSize != 0 {
+			pipe.execPipe()
+		}
+	}
+	pipe.Mu.Unlock()
+}
+
+func (pipe *Pipe) execPipe() {
 	pipe.WasExecutedLastTime = true
 	writeBufLen := len(pipe.writeBuf)
 	if writeBufLen == 0 {

@@ -19,8 +19,12 @@ type Client struct {
 	hierarchy     [][]string
 	shardMetadata []atomic.Uint32
 
-	writePool chan *pipe.Pipe
-	readPool  chan *pipe.Pipe
+	writePool      []*pipe.Pipe
+	writePoolCount atomic.Uint64
+	readPool       []*pipe.Pipe
+	readPoolCount  atomic.Uint64
+
+	par uint64
 }
 
 type Config struct {
@@ -76,8 +80,11 @@ func NewClient(cfg *Config) (*Client, error) {
 		hierarchy:     nil,
 		shardMetadata: nil,
 
-		writePool: make(chan *pipe.Pipe, cfg.Par),
-		readPool:  make(chan *pipe.Pipe, cfg.Par),
+		writePool:      make([]*pipe.Pipe, cfg.Par),
+		writePoolCount: atomic.Uint64{},
+		readPool:       make([]*pipe.Pipe, cfg.Par),
+		readPoolCount:  atomic.Uint64{},
+		par:            uint64(cfg.Par),
 	}
 
 	for i := 0; i < cfg.Par; i++ {
@@ -85,17 +92,29 @@ func NewClient(cfg *Config) (*Client, error) {
 		pipeImpl2 := pipe.NewPipe(pipeCfg)
 		go pipeImpl1.Start()
 		go pipeImpl2.Start()
-		time.Sleep(17 * time.Microsecond)
-		go pipeImpl1.StartTimer()
-		go pipeImpl2.StartTimer()
+		//time.Sleep(17 * time.Microsecond)
+		//go pipeImpl1.StartTimer()
+		//go pipeImpl2.StartTimer()
 
-		c.writePool <- pipeImpl1
-		c.readPool <- pipeImpl2
+		c.writePool[i] = pipeImpl1
+		c.readPool[i] = pipeImpl2
 	}
+
+	go func() {
+		for {
+			time.Sleep(100 * time.Microsecond)
+			for i := 0; i < cfg.Par; i++ {
+				go c.readPool[i].ExecPipe()
+				c.readPoolCount.Store(0)
+				go c.writePool[i].ExecPipe()
+				c.writePoolCount.Store(0)
+			}
+		}
+	}()
 
 	tries := 0
 	{
-		conn := <-c.readPool
+		conn := c.readPool[0]
 	connect:
 		pingRes := conn.Ping()
 		shardMetadataRes := conn.GetShardMetadata()
@@ -106,7 +125,6 @@ func NewClient(cfg *Config) (*Client, error) {
 			time.Sleep(time.Millisecond * 200)
 			tries++
 			if tries == 50 {
-				c.readPool <- conn
 				return nil, errors.New("can't connect to the server")
 			}
 			<-shardMetadataRes
@@ -119,7 +137,6 @@ func NewClient(cfg *Config) (*Client, error) {
 			time.Sleep(time.Millisecond * 200)
 			tries++
 			if tries == 50 {
-				c.readPool <- conn
 				return nil, errors.New("can't get shard metadata")
 			}
 			<-hierarchyRes
@@ -136,7 +153,6 @@ func NewClient(cfg *Config) (*Client, error) {
 			time.Sleep(time.Millisecond * 200)
 			tries++
 			if tries == 50 {
-				c.readPool <- conn
 				return nil, errors.New("can't get hierarchy")
 			}
 			goto connect
@@ -169,7 +185,6 @@ func NewClient(cfg *Config) (*Client, error) {
 		hierarchy = append(hierarchy, node)
 		c.hierarchy = make([][]string, len(hierarchy))
 		copy(c.hierarchy, hierarchy[:])
-		c.readPool <- conn
 	}
 
 	return c, nil
@@ -178,9 +193,9 @@ func NewClient(cfg *Config) (*Client, error) {
 func (c *Client) CallReadFunc(f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
 	retryCount := 0
 retry:
-	conn := <-c.readPool
+	count := c.readPoolCount.Add(1)
+	conn := c.readPool[count%c.par]
 	ch := f(conn)
-	c.readPool <- conn
 	var res pipe.Res
 	res = <-ch
 	if res.Err != nil {
@@ -201,9 +216,9 @@ retry:
 }
 
 func (c *Client) CallWriteFunc(f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
-	conn := <-c.writePool
+	count := c.readPoolCount.Add(1)
+	conn := c.readPool[count%c.par]
 	ch := f(conn)
-	c.writePool <- conn
 	var res pipe.Res
 	res = <-ch
 	if res.Err != nil {
