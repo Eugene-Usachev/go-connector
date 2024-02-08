@@ -134,7 +134,7 @@ func NewClient(cfg *Config) (*Client, error) {
 		pipeImpl2 := pipe.NewPipe(pipeCfgForShard)
 		go pipeImpl1.Start()
 		go pipeImpl2.Start()
-		time.Sleep(17 * time.Microsecond)
+		//time.Sleep(17 * time.Microsecond)
 		//go pipeImpl1.StartTimer()
 		//go pipeImpl2.StartTimer()
 
@@ -144,7 +144,7 @@ func NewClient(cfg *Config) (*Client, error) {
 
 	go func() {
 		for {
-			time.Sleep(1000 * time.Microsecond)
+			time.Sleep(100 * time.Microsecond)
 			go c.serverConn.ExecPipe()
 			for i := 0; i < cfg.Par; i++ {
 				go c.writePool[i].ExecPipe()
