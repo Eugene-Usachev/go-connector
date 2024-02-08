@@ -46,57 +46,57 @@ func NewClient(cfg *Config) (*Client, error) {
 	connPool := &sync.Pool{
 		New: func() interface{} {
 			retries := 0
-			retry:
-				conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", cfg.Host, cfg.Port))
+		retry:
+			conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", cfg.Host, cfg.Port))
+			if err != nil {
+				log.Println("[NimbleDB] Error connecting to the database: ", err)
+				return nil
+			}
+			if len(cfg.Password) > 0 {
+				err := conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 				if err != nil {
-					log.Println("[NimbleDB] Error connecting to the database: ", err)
-					return nil
+					if retries > 10 {
+						return nil
+					}
+					retries++
+					goto retry
 				}
-				if len(cfg.Password) > 0 {
-					err := conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
-					if err != nil {
-						if retries > 10 {
-							return nil
-						}
-						retries++
-						goto retry
+				_, err = conn.Write(fastbytes.S2B(cfg.Password))
+				if err != nil {
+					if retries > 10 {
+						log.Println("[NimbleDB] Error connecting to the database: ", err)
+						return nil
 					}
-					_, err = conn.Write(fastbytes.S2B(cfg.Password))
-					if err != nil {
-						if retries > 10 {
-							log.Println("[NimbleDB] Error connecting to the database: ", err)
-							return nil
-						}
-						retries++
-						goto retry
-					}
+					retries++
+					goto retry
+				}
 
-					status := make([]byte, 1)
-					err = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-					if err != nil {
-						if retries > 10 {
-							return nil
-						}
-						retries++
-						goto retry
+				status := make([]byte, 1)
+				err = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+				if err != nil {
+					if retries > 10 {
+						return nil
 					}
-					_, err = conn.Read(status[:])
-					if err != nil {
-						if retries > 10 {
-							log.Println("[NimbleDB] Error connecting to the database: ", err)
-							return nil
-						}
-						retries++
-						goto retry
+					retries++
+					goto retry
+				}
+				_, err = conn.Read(status[:])
+				if err != nil {
+					if retries > 10 {
+						log.Println("[NimbleDB] Error connecting to the database: ", err)
+						return nil
 					}
-					if status[0] != constants.Done {
-						if retries > 10 {
-							log.Println("[NimbleDB] Error connecting to the database. Status: ", string(status))
-							return nil
-						}
-						retries++
-						goto retry
+					retries++
+					goto retry
+				}
+				if status[0] != constants.Done {
+					if retries > 10 {
+						log.Println("[NimbleDB] Error connecting to the database. Status: ", string(status))
+						return nil
 					}
+					retries++
+					goto retry
+				}
 			}
 
 			return conn
@@ -121,7 +121,7 @@ func NewClient(cfg *Config) (*Client, error) {
 		readPool:  readPipes,
 	}
 	go c.serverConn.Start()
-	go c.serverConn.StartTimer()
+	//go c.serverConn.StartTimer()
 	for i := 0; i < cfg.Par; i++ {
 		pipeCfgForShard := &pipe.Config{
 			ConnPool: connPool,
@@ -135,12 +135,23 @@ func NewClient(cfg *Config) (*Client, error) {
 		go pipeImpl1.Start()
 		go pipeImpl2.Start()
 		time.Sleep(17 * time.Microsecond)
-		go pipeImpl1.StartTimer()
-		go pipeImpl2.StartTimer()
+		//go pipeImpl1.StartTimer()
+		//go pipeImpl2.StartTimer()
 
 		c.writePool = append(c.writePool, pipeImpl1)
 		c.readPool = append(c.readPool, pipeImpl2)
 	}
+
+	go func() {
+		for {
+			time.Sleep(1000 * time.Microsecond)
+			go c.serverConn.ExecPipe()
+			for i := 0; i < cfg.Par; i++ {
+				go c.writePool[i].ExecPipe()
+				go c.readPool[i].ExecPipe()
+			}
+		}
+	}()
 
 	tries := 0
 	{
