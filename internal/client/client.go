@@ -15,6 +15,8 @@ import (
 	"time"
 )
 
+const number = 6
+
 func getHash(key []byte) uint64 {
 	var hash uint64 = 0
 	for _, b := range key {
@@ -103,9 +105,9 @@ func NewClient(cfg *Config) (*Client, error) {
 		},
 	}
 
-	// TODO not 6
-	writePipes := make([]*pipe.Pipe, 0, 6)
-	readPipes := make([]*pipe.Pipe, 0, 6)
+	// TODO not number
+	writePipes := make([]*pipe.Pipe, 0, number)
+	readPipes := make([]*pipe.Pipe, 0, number)
 
 	c := &Client{
 		hierarchy:     nil,
@@ -122,11 +124,11 @@ func NewClient(cfg *Config) (*Client, error) {
 	}
 	go c.serverConn.Start()
 	//go c.serverConn.StartTimer()
-	for i := 0; i < cfg.Par; i++ {
+	for i := 0; i < number; i++ {
 		pipeCfgForShard := &pipe.Config{
 			ConnPool: connPool,
-			// TODO not 6
-			ShardNumber:        uint32(i % 6),
+			// TODO not number
+			ShardNumber:        uint32(i % number),
 			MaxQueueSize:       cfg.MaxQueueSize,
 			MaxWriteBufferSize: cfg.MaxWriteBufferSize,
 		}
@@ -146,7 +148,7 @@ func NewClient(cfg *Config) (*Client, error) {
 		for {
 			time.Sleep(100 * time.Microsecond)
 			go c.serverConn.ExecPipe()
-			for i := 0; i < cfg.Par; i++ {
+			for i := 0; i < number; i++ {
 				go c.writePool[i].ExecPipe()
 				go c.readPool[i].ExecPipe()
 			}
@@ -253,7 +255,7 @@ func (c *Client) CallServerFunc(f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, 
 func (c *Client) CallReadFunc(hash uint64, f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
 	retryCount := 0
 retry:
-	conn := c.readPool[hash%6]
+	conn := c.readPool[hash%number]
 	ch := f(conn)
 	var res pipe.Res
 	// TODO: now unsafe!
@@ -276,7 +278,7 @@ retry:
 }
 
 func (c *Client) CallWriteFunc(hash uint64, f func(conn *pipe.Pipe) chan pipe.Res) ([]byte, error) {
-	conn := c.writePool[hash%6]
+	conn := c.writePool[hash%number]
 	ch := f(conn)
 	var res pipe.Res
 	// TODO: now unsafe!
