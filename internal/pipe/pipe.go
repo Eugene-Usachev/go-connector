@@ -54,6 +54,8 @@ type Res struct {
 }
 
 type Pipe struct {
+	isReading bool
+
 	writeBuf []byte
 	connPool *sync.Pool
 
@@ -71,20 +73,21 @@ type Pipe struct {
 	WasExecutedLastTime bool
 }
 
-type Config struct {
+type PipeConfig struct {
 	ConnPool           *sync.Pool
 	MaxQueueSize       int
 	MaxWriteBufferSize int
 }
 
-func NewPipe(cfg *Config) *Pipe {
+func NewPipe(cfg *PipeConfig, isReading bool) *Pipe {
 	if cfg.MaxWriteBufferSize > bufferSize {
 		cfg.MaxWriteBufferSize = bufferSize
-	} else if cfg.MaxWriteBufferSize < 4 {
+	} else if cfg.MaxWriteBufferSize < 5 {
 		cfg.MaxWriteBufferSize = bufferSize
 	}
 	pipe := &Pipe{
-		writeBuf:            make([]byte, 4, cfg.MaxWriteBufferSize),
+		isReading:           isReading,
+		writeBuf:            make([]byte, 5, cfg.MaxWriteBufferSize),
 		reader:              reader.NewBufReader(),
 		Result:              make(chan Res),
 		queue:               make(chan []byte),
@@ -95,6 +98,13 @@ func NewPipe(cfg *Config) *Pipe {
 		QueueSize:           0,
 		WasExecutedLastTime: false,
 	}
+
+	if isReading {
+		pipe.writeBuf[4] = 1
+	} else {
+		pipe.writeBuf[4] = 0
+	}
+
 	return pipe
 }
 
@@ -108,7 +118,12 @@ func (pipe *Pipe) Start() {
 				if len(data) > pipe.maxWriteBufferSize {
 					pipe.writeBuf = append(pipe.writeBuf, data...)
 					pipe.execPipe()
-					pipe.writeBuf = make([]byte, 4, pipe.maxWriteBufferSize)
+					pipe.writeBuf = make([]byte, 5, pipe.maxWriteBufferSize)
+					if pipe.isReading {
+						pipe.writeBuf[4] = 1
+					} else {
+						pipe.writeBuf[4] = 0
+					}
 					pipe.Mu.Unlock()
 					continue
 				} else {
@@ -128,21 +143,6 @@ func (pipe *Pipe) Start() {
 	}
 }
 
-//func (pipe *Pipe) StartTimer() {
-//	for {
-//		time.Sleep(100 * time.Microsecond)
-//		pipe.Mu.Lock()
-//		if pipe.WasExecutedLastTime {
-//			pipe.WasExecutedLastTime = false
-//		} else {
-//			if pipe.QueueSize != 0 {
-//				pipe.execPipe()
-//			}
-//		}
-//		pipe.Mu.Unlock()
-//	}
-//}
-
 func (pipe *Pipe) ExecPipe() {
 	pipe.Mu.Lock()
 	if pipe.WasExecutedLastTime {
@@ -157,7 +157,7 @@ func (pipe *Pipe) ExecPipe() {
 
 func (pipe *Pipe) execPipe() {
 	pipe.WasExecutedLastTime = true
-	writeBufLen := len(pipe.writeBuf)
+	writeBufLen := len(pipe.writeBuf) - 5
 	if writeBufLen == 0 {
 		return
 	}
@@ -175,8 +175,8 @@ func (pipe *Pipe) execPipe() {
 	}
 	defer pipe.connPool.Put(conn)
 	pipe.writeBuf[0], pipe.writeBuf[1], pipe.writeBuf[2], pipe.writeBuf[3] = byte(writeBufLen), byte(writeBufLen>>8), byte(writeBufLen>>16), byte(writeBufLen>>24)
-	_, err = conn.Write(pipe.writeBuf[:writeBufLen])
-	pipe.writeBuf = pipe.writeBuf[:4]
+	_, err = conn.Write(pipe.writeBuf[:writeBufLen+5])
+	pipe.writeBuf = pipe.writeBuf[:5]
 	if err != nil {
 		for i := 0; i < pipe.QueueSize; i++ {
 			pipe.Result <- Res{
