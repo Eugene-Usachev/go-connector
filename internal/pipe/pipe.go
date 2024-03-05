@@ -188,7 +188,7 @@ func (pipe *Pipe) execPipe() {
 		return
 	}
 
-	err = conn.SetReadDeadline(time.Now().Add(time.Second * 3))
+	err = conn.SetReadDeadline(time.Now().Add(time.Second * 15))
 	if err != nil {
 		for i := 0; i < pipe.QueueSize; i++ {
 			pipe.Result <- Res{
